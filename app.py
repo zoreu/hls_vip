@@ -13,19 +13,12 @@ from urllib3.exceptions import IncompleteRead
 import time
 import logging
 from contextlib import contextmanager
+from multiprocessing import Manager
+import sqlite3
+from datetime import datetime, timedelta
+import asyncio
 
-@contextmanager
-def session_manager():
-    session = requests.Session()
-    try:
-        yield session
-    finally:
-        try:
-            session.close()  # Garante que a sessão seja fechada
-        except:
-            pass
-
-
+# Configuração de logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -39,27 +32,70 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Limite de uma conexão simultânea entre todos os workers
+manager = Manager()
+connection_limit = manager.Semaphore(1)  # Apenas 1 conexão por vez
+
+# Configuração do SQLite
+DB_PATH = "cache.db"
+
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS cache (
+                cache_key TEXT PRIMARY KEY,
+                data BLOB,
+                expires_at TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+# Inicializar o banco na inicialização
+@app.on_event("startup")
+async def startup():
+    init_db()
+    # Iniciar tarefa de limpeza periódica
+    asyncio.create_task(cleanup_cache())
+
+# Tarefa periódica para limpar cache expirado
+async def cleanup_cache():
+    while True:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM cache WHERE expires_at < ?", (datetime.now(),))
+                conn.commit()
+                logging.debug("[HLS Proxy] Cache expirado limpo do SQLite")
+        except Exception as e:
+            logging.error(f"[HLS Proxy] Erro ao limpar cache: {e}")
+        await asyncio.sleep(300)  # Limpar a cada 5 minutos
+
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-# Modificar os caches para usar uma chave composta de IP e URL
-IP_CACHE_TS = {}
-IP_CACHE_MP4 = {}
-AGENT_OF_CHAOS = {}
-COUNT_CLEAR = {}
+
+@contextmanager
+def session_manager():
+    session = requests.Session()
+    try:
+        yield session
+    finally:
+        try:
+            session.close()
+            logging.debug("Sessão HTTP fechada")
+        except:
+            pass
 
 def get_ip(request):
     forwarded_for = request.headers.get("x-forwarded-for")
     real_ip = request.headers.get("x-real-ip")
-
     if forwarded_for:
-        ip = forwarded_for.split(",")[0].strip()  # pega o primeiro IP da lista
+        ip = forwarded_for.split(",")[0].strip()
     elif real_ip:
         ip = real_ip
     else:
-        ip = request.client.host  # fallback
+        ip = request.client.host
     return ip
 
 def get_cache_key(client_ip: str, url: str) -> str:
-    """Gera uma chave única combinando client_ip e url."""
     return f"{client_ip}:{url}"
 
 def rewrite_m3u8_urls(playlist_content: str, base_url: str, request: Request) -> str:
@@ -80,7 +116,6 @@ def rewrite_m3u8_urls(playlist_content: str, base_url: str, request: Request) ->
         except ValueError as e:
             logging.debug(f"[HLS Proxy] Erro ao resolver URL {segment_url}: {e}")
             return segment_url
-
     return re.sub(r'^(?!#)\S+', replace_url, playlist_content, flags=re.MULTILINE)
 
 async def stream_response(response, url: str, headers: dict, sess: requests.Session):
@@ -90,12 +125,13 @@ async def stream_response(response, url: str, headers: dict, sess: requests.Sess
                 if chunk:
                     yield chunk
         except (IncompleteRead, ConnectionError) as e:
-            pass
+            logging.debug(f"[HLS Proxy] Erro ao processar chunks: {e}")
         except Exception as e:
             logging.debug(f"[HLS Proxy] Erro inesperado ao processar chunks: {e}")
         finally:
             try:
                 sess.close()
+                logging.debug("Sessão fechada em stream_response")
             except:
                 pass
 
@@ -109,92 +145,115 @@ async def stream_response(response, url: str, headers: dict, sess: requests.Sess
         except StopIteration:
             break
 
-
 @app.get("/proxy")
 async def proxy(url: str, request: Request):
+    client_ip = get_ip(request)
+    cache_key = get_cache_key(client_ip, url) if '.mp4' in url.lower() or '.m3u8' in url.lower() else client_ip
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
+    # Verificar cache no SQLite
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute("SELECT data FROM cache WHERE cache_key = ? AND expires_at > ?", (cache_key, datetime.now()))
+        cached_response = cursor.fetchone()
+        if cached_response:
+            logging.debug(f"[HLS Proxy] Retornando do cache SQLite para {cache_key}")
+            media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4'
+            return StreamingResponse(
+                content=iter([cached_response[0]]),
+                media_type=media_type
+            )
+
     default_headers = {
         "User-Agent": DEFAULT_USER_AGENT,
-        'Accept-Encoding': 'identity',
-        'Accept': '*/*'
+        "Accept-Encoding": "identity",
+        "Accept": "*/*",
+        "Connection": "close"  # Evita conexões persistentes
     }
-    with session_manager() as session:
-        session.headers.update(default_headers)
-        max_retries = 3
-        attempts = 0
-        tried_without_range = False
 
-        while attempts < max_retries:
-            if not ('.m3u8' in url.lower() or '.mp4' in url.lower() or '.ts' in url.lower() or '/hl' in url.lower()):
-                logging.debug(f"[HLS Proxy] URL inválida: {url}")
-                raise HTTPException(status_code=400, detail="Nenhuma URL compatível com o proxy")
+    with connection_limit:  # Limita a 1 conexão simultânea
+        with session_manager() as session:
+            session.headers.update(default_headers)
+            max_retries = 2
+            attempts = 0
+            tried_without_range = False
 
-            try:
-                range_header = request.headers.get('Range')
-                if '.mp4' in url.lower() and range_header and not tried_without_range:
-                    default_headers['Range'] = range_header
-                else:
-                    default_headers.pop('Range', None)
+            while attempts < max_retries:
+                if not ('.m3u8' in url.lower() or '.mp4' in url.lower() or '.ts' in url.lower() or '/hl' in url.lower()):
+                    logging.debug(f"[HLS Proxy] URL inválida: {url}")
+                    raise HTTPException(status_code=400, detail="Nenhuma URL compatível com o proxy")
 
-                if '.mp4' in url.lower():
-                    headers = default_headers
-                    response = session.get(url, headers=headers, allow_redirects=True, stream=True, timeout=60)
-                else:
-                    headers = default_headers
-                    response = session.get(url, allow_redirects=True, stream=True, timeout=60)
+                try:
+                    range_header = request.headers.get('Range')
+                    if '.mp4' in url.lower() and range_header and not tried_without_range:
+                        default_headers['Range'] = range_header
+                    else:
+                        default_headers.pop('Range', None)
 
-                if response.status_code in (200, 206):
-                    content_type = response.headers.get('content-type', '').lower()
+                    logging.debug(f"[HLS Proxy] Iniciando requisição para {url} por {client_ip}")
+                    response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=10)
 
-                    if 'application/x-mpegURL' in content_type or 'application/vnd.apple.mpegurl' in content_type or '.m3u8' in url.lower():
-                        base_url = url.rsplit('/', 1)[0]
-                        playlist_content = response.content.decode('utf-8', errors='ignore')
-                        rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
+                    if response.status_code in (200, 206):
+                        content_type = response.headers.get('content-type', '').lower()
+
+                        if 'application/x-mpegURL' in content_type or 'application/vnd.apple.mpegurl' in content_type or '.m3u8' in url.lower():
+                            base_url = url.rsplit('/', 1)[0]
+                            playlist_content = response.content.decode('utf-8', errors='ignore')
+                            rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
+                            # Salvar no cache SQLite
+                            with sqlite3.connect(DB_PATH) as conn:
+                                expires_at = datetime.now() + timedelta(seconds=300)  # Expira em 5 minutos
+                                conn.execute(
+                                    "INSERT OR REPLACE INTO cache (cache_key, data, expires_at) VALUES (?, ?, ?)",
+                                    (cache_key, rewritten_playlist.encode('utf-8'), expires_at)
+                                )
+                                conn.commit()
+                            return StreamingResponse(
+                                content=iter([rewritten_playlist.encode('utf-8')]),
+                                media_type='application/x-mpegURL'
+                            )
+
+                        response_headers = {
+                            key: value for key, value in response.headers.items()
+                            if key.lower() in ('content-type', 'accept-ranges', 'content-range')
+                        }
+                        response_headers['Connection'] = 'close'
+
+                        media_type = (
+                            'video/mp4' if '.mp4' in url.lower()
+                            else 'video/mp2t' if '.ts' in url.lower() or '/hl' in url
+                            else response_headers.get('content-type', 'application/octet-stream')
+                        )
+                        status_code = 206 if response.status_code == 206 else 200
+
+                        if response.status_code == 206 and 'Content-Range' in response.headers:
+                            response_headers['Content-Range'] = response.headers.get('Content-Range', '')
+
                         return StreamingResponse(
-                            content=iter([rewritten_playlist.encode('utf-8')]),
-                            media_type='application/x-mpegURL'
+                            content=stream_response(response, url, default_headers, session),
+                            media_type=media_type,
+                            headers=response_headers,
+                            status_code=status_code
                         )
 
-                    response_headers = {
-                        key: value for key, value in response.headers.items()
-                        if key.lower() in ('content-type', 'accept-ranges', 'content-range')
-                    }
+                    elif response.status_code == 416:
+                        if range_header and not tried_without_range:
+                            tried_without_range = True
+                            continue
+                        else:
+                            raise HTTPException(status_code=416, detail="Range Not Satisfiable")
 
-                    media_type = (
-                        'video/mp4' if '.mp4' in url.lower()
-                        else 'video/mp2t' if '.ts' in url.lower() or '/hl' in url
-                        else response_headers.get('content-type', 'application/octet-stream')
-                    )
-
-                    status_code = 206 if response.status_code == 206 else 200
-
-                    if response.status_code == 206 and 'Content-Range' in response.headers:
-                        response_headers['Content-Range'] = response.headers.get('Content-Range', '')
-
-                    return StreamingResponse(
-                        content=stream_response(response, url, headers, session),
-                        media_type=media_type,
-                        headers=response_headers,
-                        status_code=status_code
-                    )
-
-                elif response.status_code == 416:
-                    if range_header and not tried_without_range:
-                        tried_without_range = True
-                        continue
+                    elif response.status_code == 404 and ('.ts' in url.lower() or '/hl' in url.lower()):
+                        time.sleep(1)
                     else:
-                        raise HTTPException(status_code=416, detail="Range Not Satisfiable")
+                        time.sleep(1)
+                    attempts += 1
+                except RequestException as e:
+                    logging.error(f"[HLS Proxy] Erro ao processar {url}: {e}")
+                    time.sleep(1)
+                    attempts += 1
 
-                elif response.status_code == 404 and ('.ts' in url.lower() or '/hl' in url.lower()):
-                    time.sleep(2)
-                else:                       
-                    time.sleep(2)
-            except RequestException as e: 
-                time.sleep(2)
-
-    raise HTTPException(status_code=502, detail="Falha ao conectar após múltiplas tentativas")
+            raise HTTPException(status_code=502, detail="Falha ao conectar após múltiplas tentativas")
 
 @app.head("/proxy")
 async def proxy_head(url: str, request: Request):
@@ -202,25 +261,27 @@ async def proxy_head(url: str, request: Request):
 
 @app.get("/check")
 async def check(url: str, request: Request):
-    session = requests.Session()
     if '.m3u8' in url or 'get.php' in url:
         default_headers = {
             "User-Agent": DEFAULT_USER_AGENT,
-            'Accept-Encoding': 'identity',
-            'Accept': '*/*',
-            'Connection': 'keep-alive'
+            "Accept-Encoding": "identity",
+            "Accept": "*/*",
+            "Connection": "close"
         }
-        response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=15)
-        if response.status_code != 200:
-            default_headers.update({'User-Agent': binascii.b2a_hex(os.urandom(20))[:32]})
-            response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=15)
-        try:
-            return {'code': response.status_code}
-        except:
-            return {'code': 'error'}
+        with session_manager() as session:
+            session.headers.update(default_headers)
+            try:
+                response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=10)
+                if response.status_code != 200:
+                    default_headers.update({'User-Agent': binascii.b2a_hex(os.urandom(20))[:32]})
+                    response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=10)
+                return {'code': response.status_code}
+            except Exception as e:
+                logging.error(f"[HLS Proxy] Erro no check {url}: {e}")
+                return {'code': 'error'}
     else:
         return {'message': 'only m3u8 links'}
 
 @app.get("/")
 def main_index():
-    return {"message": "PROXY ONEPLAY VIP ver: 1.0.1"}
+    return {"message": "PROXY ONEPLAY VIP ver: 1.0.5"}
