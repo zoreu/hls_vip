@@ -38,7 +38,7 @@ app.add_middleware(
 manager = Manager()
 connection_limit = manager.Semaphore(1)  # Apenas 1 conexão por vez
 
-# Caminho do SQLite no Hugging Face Spaces (usar /tmp para escrita garantida)
+# Caminho do SQLite no Hugging Face Spaces
 DB_PATH = "/tmp/cache.db"
 
 # Cache em memória como fallback
@@ -46,9 +46,9 @@ memory_cache = TTLCache(maxsize=100, ttl=300)
 
 def init_db():
     try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # Criar diretório, se necessário
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         with sqlite3.connect(DB_PATH, timeout=10) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")  # Habilitar Write-Ahead Logging para concorrência
+            conn.execute("PRAGMA journal_mode=WAL")  # Suporte a concorrência
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS cache (
                     cache_key TEXT PRIMARY KEY,
@@ -60,16 +60,12 @@ def init_db():
             logging.debug("[HLS Proxy] Banco SQLite inicializado com sucesso")
     except sqlite3.OperationalError as e:
         logging.error(f"[HLS Proxy] Erro ao inicializar SQLite: {e}")
-        # Não falhar na inicialização; usar cache em memória como fallback
 
-# Inicializar o banco na inicialização
 @app.on_event("startup")
 async def startup():
     init_db()
-    # Iniciar tarefa de limpeza periódica
     asyncio.create_task(cleanup_cache())
 
-# Tarefa periódica para limpar cache expirado
 async def cleanup_cache():
     while True:
         try:
@@ -191,7 +187,7 @@ async def proxy(url: str, request: Request):
         "User-Agent": DEFAULT_USER_AGENT,
         "Accept-Encoding": "identity",
         "Accept": "*/*",
-        "Connection": "close"  # Evita conexões persistentes
+        "Connection": "close"
     }
 
     with connection_limit:  # Limita a 1 conexão simultânea
@@ -214,7 +210,7 @@ async def proxy(url: str, request: Request):
                         default_headers.pop('Range', None)
 
                     logging.debug(f"[HLS Proxy] Iniciando requisição para {url} por {client_ip}")
-                    response = session.get(url, headers=default_headers, allow_redirects=True, station=True, timeout=10)
+                    response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=10)
 
                     if response.status_code in (200, 206):
                         content_type = response.headers.get('content-type', '').lower()
@@ -223,7 +219,6 @@ async def proxy(url: str, request: Request):
                             base_url = url.rsplit('/', 1)[0]
                             playlist_content = response.content.decode('utf-8', errors='ignore')
                             rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
-                            # Salvar no cache SQLite
                             try:
                                 with sqlite3.connect(DB_PATH, timeout=10) as conn:
                                     expires_at = datetime.now() + timedelta(seconds=300)
@@ -233,8 +228,8 @@ async def proxy(url: str, request: Request):
                                     )
                                     conn.commit()
                             except sqlite3.OperationalError as e:
-                                logging.error(f"[HLS Proxy536] Erro ao salvar no SQLite: {e}")
-                                memory_cache[cache_key] = rewritten_playlist.encode('utf-8')  # Fallback para cache em memória
+                                logging.error(f"[HLS Proxy] Erro ao salvar no SQLite: {e}")
+                                memory_cache[cache_key] = rewritten_playlist.encode('utf-8')
                             return StreamingResponse(
                                 content=iter([rewritten_playlist.encode('utf-8')]),
                                 media_type='application/x-mpegURL'
@@ -311,4 +306,4 @@ async def check(url: str, request: Request):
 
 @app.get("/")
 def main_index():
-    return {"message": "PROXY ONEPLAY VIP ver: 1.0.5"}
+    return {"message": "PROXY ONEPLAY VIP ver: 1.0.6"}
