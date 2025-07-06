@@ -105,6 +105,12 @@ def get_ip(request):
 def get_cache_key(client_ip: str, url: str) -> str:
     return f"{client_ip}:{url}"
 
+def get_cache_ttl(url: str) -> int:
+    """Retorna o TTL apropriado com base no tipo de URL."""
+    if '.m3u8' in url.lower():
+        return 6  # TTL curto para playlists dinâmicas
+    return 300  # TTL longo para segmentos .ts ou .mp4
+
 def rewrite_m3u8_urls(playlist_content: str, base_url: str, request: Request) -> str:
     def replace_url(match):
         segment_url = match.group(0).strip()
@@ -155,14 +161,17 @@ async def stream_response(response, url: str, headers: dict, sess: requests.Sess
 @app.get("/proxy")
 async def proxy(url: str, request: Request):
     client_ip = get_ip(request)
-    cache_key = get_cache_key(client_ip, url) if '.mp4' in url.lower() or '.m3u8' in url.lower() else client_ip
+    cache_key = get_cache_key(client_ip, url) if '.mp4' in url.lower() or '.m3u8' in url.lower() or '.ts' in url.lower() else client_ip
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
+
+    # Determinar TTL com base no tipo de URL
+    ttl = get_cache_ttl(url)
 
     # Verificar cache em memória (fallback)
     if cache_key in memory_cache:
         logging.debug(f"[HLS Proxy] Retornando do cache em memória para {cache_key}")
-        media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4'
+        media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4' if '.mp4' in url.lower() else 'video/mp2t'
         return StreamingResponse(
             content=iter([memory_cache[cache_key]]),
             media_type=media_type
@@ -175,7 +184,7 @@ async def proxy(url: str, request: Request):
             cached_response = cursor.fetchone()
             if cached_response:
                 logging.debug(f"[HLS Proxy] Retornando do cache SQLite para {cache_key}")
-                media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4'
+                media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4' if '.mp4' in url.lower() else 'video/mp2t'
                 return StreamingResponse(
                     content=iter([cached_response[0]]),
                     media_type=media_type
@@ -221,7 +230,7 @@ async def proxy(url: str, request: Request):
                             rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
                             try:
                                 with sqlite3.connect(DB_PATH, timeout=10) as conn:
-                                    expires_at = datetime.now() + timedelta(seconds=300)
+                                    expires_at = datetime.now() + timedelta(seconds=ttl)
                                     conn.execute(
                                         "INSERT OR REPLACE INTO cache (cache_key, data, expires_at) VALUES (?, ?, ?)",
                                         (cache_key, rewritten_playlist.encode('utf-8'), expires_at)
@@ -250,6 +259,21 @@ async def proxy(url: str, request: Request):
 
                         if response.status_code == 206 and 'Content-Range' in response.headers:
                             response_headers['Content-Range'] = response.headers.get('Content-Range', '')
+
+                        # Cachear segmentos .ts no SQLite
+                        if '.ts' in url.lower() or '/hl' in url.lower():
+                            try:
+                                content = response.content
+                                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                                    expires_at = datetime.now() + timedelta(seconds=ttl)
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO cache (cache_key, data, expires_at) VALUES (?, ?, ?)",
+                                        (cache_key, content, expires_at)
+                                    )
+                                    conn.commit()
+                            except sqlite3.OperationalError as e:
+                                logging.error(f"[HLS Proxy] Erro ao salvar .ts no SQLite: {e}")
+                                memory_cache[cache_key] = content
 
                         return StreamingResponse(
                             content=stream_response(response, url, default_headers, session),
@@ -306,4 +330,4 @@ async def check(url: str, request: Request):
 
 @app.get("/")
 def main_index():
-    return {"message": "PROXY ONEPLAY VIP ver: 1.0.6"}
+    return {"message": "PROXY ONEPLAY VIP ver: 1.0.7"}
