@@ -17,6 +17,7 @@ from multiprocessing import Manager
 import sqlite3
 from datetime import datetime, timedelta
 import asyncio
+from cachetools import TTLCache
 
 # Configuração de logging
 logging.basicConfig(
@@ -37,19 +38,29 @@ app.add_middleware(
 manager = Manager()
 connection_limit = manager.Semaphore(1)  # Apenas 1 conexão por vez
 
-# Configuração do SQLite
-DB_PATH = "cache.db"
+# Caminho do SQLite no Hugging Face Spaces (usar /tmp para escrita garantida)
+DB_PATH = "/tmp/cache.db"
+
+# Cache em memória como fallback
+memory_cache = TTLCache(maxsize=100, ttl=300)
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS cache (
-                cache_key TEXT PRIMARY KEY,
-                data BLOB,
-                expires_at TIMESTAMP
-            )
-        """)
-        conn.commit()
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # Criar diretório, se necessário
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")  # Habilitar Write-Ahead Logging para concorrência
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    cache_key TEXT PRIMARY KEY,
+                    data BLOB,
+                    expires_at TIMESTAMP
+                )
+            """)
+            conn.commit()
+            logging.debug("[HLS Proxy] Banco SQLite inicializado com sucesso")
+    except sqlite3.OperationalError as e:
+        logging.error(f"[HLS Proxy] Erro ao inicializar SQLite: {e}")
+        # Não falhar na inicialização; usar cache em memória como fallback
 
 # Inicializar o banco na inicialização
 @app.on_event("startup")
@@ -62,7 +73,7 @@ async def startup():
 async def cleanup_cache():
     while True:
         try:
-            with sqlite3.connect(DB_PATH) as conn:
+            with sqlite3.connect(DB_PATH, timeout=10) as conn:
                 conn.execute("DELETE FROM cache WHERE expires_at < ?", (datetime.now(),))
                 conn.commit()
                 logging.debug("[HLS Proxy] Cache expirado limpo do SQLite")
@@ -152,17 +163,29 @@ async def proxy(url: str, request: Request):
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
+    # Verificar cache em memória (fallback)
+    if cache_key in memory_cache:
+        logging.debug(f"[HLS Proxy] Retornando do cache em memória para {cache_key}")
+        media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4'
+        return StreamingResponse(
+            content=iter([memory_cache[cache_key]]),
+            media_type=media_type
+        )
+
     # Verificar cache no SQLite
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute("SELECT data FROM cache WHERE cache_key = ? AND expires_at > ?", (cache_key, datetime.now()))
-        cached_response = cursor.fetchone()
-        if cached_response:
-            logging.debug(f"[HLS Proxy] Retornando do cache SQLite para {cache_key}")
-            media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4'
-            return StreamingResponse(
-                content=iter([cached_response[0]]),
-                media_type=media_type
-            )
+    try:
+        with sqlite3.connect(DB_PATH, timeout=10) as conn:
+            cursor = conn.execute("SELECT data FROM cache WHERE cache_key = ? AND expires_at > ?", (cache_key, datetime.now()))
+            cached_response = cursor.fetchone()
+            if cached_response:
+                logging.debug(f"[HLS Proxy] Retornando do cache SQLite para {cache_key}")
+                media_type = 'application/x-mpegURL' if '.m3u8' in url.lower() else 'video/mp4'
+                return StreamingResponse(
+                    content=iter([cached_response[0]]),
+                    media_type=media_type
+                )
+    except sqlite3.OperationalError as e:
+        logging.error(f"[HLS Proxy] Erro ao acessar SQLite: {e}")
 
     default_headers = {
         "User-Agent": DEFAULT_USER_AGENT,
@@ -191,7 +214,7 @@ async def proxy(url: str, request: Request):
                         default_headers.pop('Range', None)
 
                     logging.debug(f"[HLS Proxy] Iniciando requisição para {url} por {client_ip}")
-                    response = session.get(url, headers=default_headers, allow_redirects=True, stream=True, timeout=10)
+                    response = session.get(url, headers=default_headers, allow_redirects=True, station=True, timeout=10)
 
                     if response.status_code in (200, 206):
                         content_type = response.headers.get('content-type', '').lower()
@@ -201,13 +224,17 @@ async def proxy(url: str, request: Request):
                             playlist_content = response.content.decode('utf-8', errors='ignore')
                             rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
                             # Salvar no cache SQLite
-                            with sqlite3.connect(DB_PATH) as conn:
-                                expires_at = datetime.now() + timedelta(seconds=300)  # Expira em 5 minutos
-                                conn.execute(
-                                    "INSERT OR REPLACE INTO cache (cache_key, data, expires_at) VALUES (?, ?, ?)",
-                                    (cache_key, rewritten_playlist.encode('utf-8'), expires_at)
-                                )
-                                conn.commit()
+                            try:
+                                with sqlite3.connect(DB_PATH, timeout=10) as conn:
+                                    expires_at = datetime.now() + timedelta(seconds=300)
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO cache (cache_key, data, expires_at) VALUES (?, ?, ?)",
+                                        (cache_key, rewritten_playlist.encode('utf-8'), expires_at)
+                                    )
+                                    conn.commit()
+                            except sqlite3.OperationalError as e:
+                                logging.error(f"[HLS Proxy536] Erro ao salvar no SQLite: {e}")
+                                memory_cache[cache_key] = rewritten_playlist.encode('utf-8')  # Fallback para cache em memória
                             return StreamingResponse(
                                 content=iter([rewritten_playlist.encode('utf-8')]),
                                 media_type='application/x-mpegURL'
