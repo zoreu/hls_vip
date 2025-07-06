@@ -12,8 +12,19 @@ from requests.exceptions import ConnectionError, RequestException
 from urllib3.exceptions import IncompleteRead
 import time
 import logging
+from contextlib import contextmanager
 
-session = requests.Session()
+@contextmanager
+def session_manager():
+    session = requests.Session()
+    try:
+        yield session
+    finally:
+        try:
+            session.close()  # Garante que a sessão seja fechada
+        except:
+            pass
+
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -72,7 +83,7 @@ def rewrite_m3u8_urls(playlist_content: str, base_url: str, request: Request) ->
 
     return re.sub(r'^(?!#)\S+', replace_url, playlist_content, flags=re.MULTILINE)
 
-async def stream_response(response, client_ip: str, url: str, headers: dict, sess: requests.Session):
+async def stream_response(response, url: str, headers: dict, sess: requests.Session):
     def generate_chunks(response):
         try:
             for chunk in response.iter_content(chunk_size=4095):
@@ -83,7 +94,10 @@ async def stream_response(response, client_ip: str, url: str, headers: dict, ses
         except Exception as e:
             logging.debug(f"[HLS Proxy] Erro inesperado ao processar chunks: {e}")
         finally:
-            sess.close()
+            try:
+                sess.close()
+            except:
+                pass
 
     iterator = generate_chunks(response)
     while True:
@@ -98,12 +112,6 @@ async def stream_response(response, client_ip: str, url: str, headers: dict, ses
 
 @app.get("/proxy")
 async def proxy(url: str, request: Request):
-    #client_ip = request.client.host
-    client_ip = get_ip(request)
-    if '.mp4' in url.lower() or '.m3u8' in url.lower():
-        cache_key = get_cache_key(client_ip, url)
-    else:
-        cache_key = client_ip
     if not url:
         raise HTTPException(status_code=400, detail="No URL provided")
 
@@ -112,78 +120,79 @@ async def proxy(url: str, request: Request):
         'Accept-Encoding': 'identity',
         'Accept': '*/*'
     }
-    session.headers.update(default_headers)
-    max_retries = 4
-    attempts = 0
-    tried_without_range = False
+    with session_manager() as session:
+        session.headers.update(default_headers)
+        max_retries = 3
+        attempts = 0
+        tried_without_range = False
 
-    while attempts < max_retries:
-        if not ('.m3u8' in url.lower() or '.mp4' in url.lower() or '.ts' in url.lower() or '/hl' in url.lower()):
-            logging.debug(f"[HLS Proxy] URL inválida: {url}")
-            raise HTTPException(status_code=400, detail="Nenhuma URL compatível com o proxy")
+        while attempts < max_retries:
+            if not ('.m3u8' in url.lower() or '.mp4' in url.lower() or '.ts' in url.lower() or '/hl' in url.lower()):
+                logging.debug(f"[HLS Proxy] URL inválida: {url}")
+                raise HTTPException(status_code=400, detail="Nenhuma URL compatível com o proxy")
 
-        try:
-            range_header = request.headers.get('Range')
-            if '.mp4' in url.lower() and range_header and not tried_without_range:
-                default_headers['Range'] = range_header
-            else:
-                default_headers.pop('Range', None)
+            try:
+                range_header = request.headers.get('Range')
+                if '.mp4' in url.lower() and range_header and not tried_without_range:
+                    default_headers['Range'] = range_header
+                else:
+                    default_headers.pop('Range', None)
 
-            if '.mp4' in url.lower():
-                headers = default_headers
-                response = session.get(url, headers=headers, allow_redirects=True, stream=True, timeout=60)
-            else:
-                headers = default_headers
-                response = session.get(url, allow_redirects=True, stream=True, timeout=60)
+                if '.mp4' in url.lower():
+                    headers = default_headers
+                    response = session.get(url, headers=headers, allow_redirects=True, stream=True, timeout=60)
+                else:
+                    headers = default_headers
+                    response = session.get(url, allow_redirects=True, stream=True, timeout=60)
 
-            if response.status_code in (200, 206):
-                content_type = response.headers.get('content-type', '').lower()
+                if response.status_code in (200, 206):
+                    content_type = response.headers.get('content-type', '').lower()
 
-                if 'application/x-mpegURL' in content_type or 'application/vnd.apple.mpegurl' in content_type or '.m3u8' in url.lower():
-                    base_url = url.rsplit('/', 1)[0]
-                    playlist_content = response.content.decode('utf-8', errors='ignore')
-                    rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
-                    return StreamingResponse(
-                        content=iter([rewritten_playlist.encode('utf-8')]),
-                        media_type='application/x-mpegURL'
+                    if 'application/x-mpegURL' in content_type or 'application/vnd.apple.mpegurl' in content_type or '.m3u8' in url.lower():
+                        base_url = url.rsplit('/', 1)[0]
+                        playlist_content = response.content.decode('utf-8', errors='ignore')
+                        rewritten_playlist = rewrite_m3u8_urls(playlist_content, base_url, request)
+                        return StreamingResponse(
+                            content=iter([rewritten_playlist.encode('utf-8')]),
+                            media_type='application/x-mpegURL'
+                        )
+
+                    response_headers = {
+                        key: value for key, value in response.headers.items()
+                        if key.lower() in ('content-type', 'accept-ranges', 'content-range')
+                    }
+
+                    media_type = (
+                        'video/mp4' if '.mp4' in url.lower()
+                        else 'video/mp2t' if '.ts' in url.lower() or '/hl' in url
+                        else response_headers.get('content-type', 'application/octet-stream')
                     )
 
-                response_headers = {
-                    key: value for key, value in response.headers.items()
-                    if key.lower() in ('content-type', 'accept-ranges', 'content-range')
-                }
+                    status_code = 206 if response.status_code == 206 else 200
 
-                media_type = (
-                    'video/mp4' if '.mp4' in url.lower()
-                    else 'video/mp2t' if '.ts' in url.lower() or '/hl' in url
-                    else response_headers.get('content-type', 'application/octet-stream')
-                )
+                    if response.status_code == 206 and 'Content-Range' in response.headers:
+                        response_headers['Content-Range'] = response.headers.get('Content-Range', '')
 
-                status_code = 206 if response.status_code == 206 else 200
+                    return StreamingResponse(
+                        content=stream_response(response, url, headers, session),
+                        media_type=media_type,
+                        headers=response_headers,
+                        status_code=status_code
+                    )
 
-                if response.status_code == 206 and 'Content-Range' in response.headers:
-                    response_headers['Content-Range'] = response.headers.get('Content-Range', '')
+                elif response.status_code == 416:
+                    if range_header and not tried_without_range:
+                        tried_without_range = True
+                        continue
+                    else:
+                        raise HTTPException(status_code=416, detail="Range Not Satisfiable")
 
-                return StreamingResponse(
-                    content=stream_response(response, client_ip, url, headers, session),
-                    media_type=media_type,
-                    headers=response_headers,
-                    status_code=status_code
-                )
-
-            elif response.status_code == 416:
-                if range_header and not tried_without_range:
-                    tried_without_range = True
-                    continue
-                else:
-                    raise HTTPException(status_code=416, detail="Range Not Satisfiable")
-
-            elif response.status_code == 404 and ('.ts' in url.lower() or '/hl' in url.lower()):
+                elif response.status_code == 404 and ('.ts' in url.lower() or '/hl' in url.lower()):
+                    time.sleep(2)
+                else:                       
+                    time.sleep(2)
+            except RequestException as e: 
                 time.sleep(2)
-            else:                       
-                time.sleep(2)
-        except RequestException as e: 
-            time.sleep(2)
 
     raise HTTPException(status_code=502, detail="Falha ao conectar após múltiplas tentativas")
 
@@ -214,4 +223,4 @@ async def check(url: str, request: Request):
 
 @app.get("/")
 def main_index():
-    return {"message": "PROXY ONEPLAY VIP"}
+    return {"message": "PROXY ONEPLAY VIP ver: 1.0.1"}
